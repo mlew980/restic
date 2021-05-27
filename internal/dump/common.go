@@ -6,10 +6,10 @@ import (
 	"path"
 	"sync"
 
+	"github.com/restic/restic/internal/errors"
 	"github.com/restic/restic/internal/restic"
 	"github.com/restic/restic/internal/walker"
 	"github.com/restic/restic/internal/debug"
-	"github.com/restic/restic/internal/errors"
 
 	"golang.org/x/sync/errgroup"
 )
@@ -76,6 +76,8 @@ func dumpTree(ctx context.Context, repo restic.Repository, rootNode *restic.Node
 }
 
 const numNodeDataWorkers = 8
+
+// GetNodeData will write the contents of the node to the given output.
 func GetNodeData(ctx context.Context, output io.Writer, repo restic.Repository, node *restic.Node) error {
 	
 	type processJob struct {
@@ -176,11 +178,11 @@ func GetNodeData(ctx context.Context, output io.Writer, repo restic.Repository, 
 			currentIndex++
 		}
 
+		mutex.Unlock()
+
 		if(currentIndex == len(node.Content)){
 			break
 		}
-
-		defer mutex.Unlock()
 
 	}
 
