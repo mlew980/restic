@@ -4,10 +4,14 @@ import (
 	"context"
 	"io"
 	"path"
+	"sync"
 
-	"github.com/restic/restic/internal/errors"
 	"github.com/restic/restic/internal/restic"
 	"github.com/restic/restic/internal/walker"
+	"github.com/restic/restic/internal/debug"
+	"github.com/restic/restic/internal/errors"
+
+	"golang.org/x/sync/errgroup"
 )
 
 // dumper implements saving node data.
@@ -71,22 +75,113 @@ func dumpTree(ctx context.Context, repo restic.Repository, rootNode *restic.Node
 	return err
 }
 
-// GetNodeData will write the contents of the node to the given output.
+const numNodeDataWorkers = 8
 func GetNodeData(ctx context.Context, output io.Writer, repo restic.Repository, node *restic.Node) error {
-	var (
-		buf []byte
-		err error
-	)
-	for _, id := range node.Content {
-		buf, err = repo.LoadBlob(ctx, restic.DataBlob, id, buf)
-		if err != nil {
-			return err
+	
+	type processJob struct {
+		hash restic.ID
+		index int
+		blob []byte
+	}
+
+	wg, wgCtx := errgroup.WithContext(ctx)
+
+	inputJobs := make(chan processJob)
+
+	debug.Log("Create subprocess to populate inputJobs channel with jobs to do.")
+	wg.Go(func() error {
+		defer close(inputJobs)
+		for index, id := range node.Content {
+			var (
+				buf []byte
+			)
+			select {
+			case inputJobs <- processJob{ id, index, buf }:
+			case <-wgCtx.Done():
+				return wgCtx.Err()
+			}
+		}
+		return nil
+	})
+
+	debug.Log("Create a channel for completed jobs to feed into")
+	outputJobs := make(chan processJob)
+
+	var downloadWG sync.WaitGroup
+	downloader := func() error {
+		defer downloadWG.Done()
+		for processJobObj := range inputJobs {
+			var (
+				buf []byte
+				err error
+			)
+			buf, err = repo.LoadBlob(ctx, restic.DataBlob, processJobObj.hash, buf)
+			if err != nil {
+				return err
+			}
+
+			select {
+				case outputJobs <- processJob{ processJobObj.hash, processJobObj.index, buf }:
+				case <-wgCtx.Done():
+					return wgCtx.Err()
+			}
+
+			if err != nil {
+				return errors.Wrap(err, "Write")
+			}
+		}
+		return nil
+	}
+
+	debug.Log("Spawn %v seperate threads that would download blobs.", numNodeDataWorkers)
+	downloadWG.Add(numNodeDataWorkers)
+	for i := 0; i < numNodeDataWorkers; i++ {
+		wg.Go(downloader)
+	}
+
+	debug.Log("Once all blobs have been downloaded close the outputJobs channel.")
+	wg.Go(func() error {
+		downloadWG.Wait()
+		close(outputJobs)
+		return nil
+	})
+
+	completedJobs := make(map[int]processJob)
+
+	var mutex sync.Mutex
+
+	debug.Log("Create seperate process which reads in outputJobs as they come in and inserts them into completedJobs in the correct order (added Mutex for thread safe operation).")
+	wg.Go(func() error {
+		for outJob := range outputJobs {
+			mutex.Lock()
+			completedJobs[outJob.index] = outJob
+			mutex.Unlock()
+		}
+		return nil
+	})
+
+	debug.Log("Keep looping until the next expectant job is completed and we can write it to io.Writer.")
+	
+	currentIndex := 0
+
+	for {
+
+		mutex.Lock()
+
+		_, exists := completedJobs[currentIndex]
+		if exists {
+			debug.Log("If item exists write it to io.Writer and delete it from the map.")
+			output.Write(completedJobs[currentIndex].blob)
+			delete(completedJobs, currentIndex)
+			currentIndex++
 		}
 
-		_, err = output.Write(buf)
-		if err != nil {
-			return errors.Wrap(err, "Write")
+		if(currentIndex == len(node.Content)){
+			break
 		}
+
+		defer mutex.Unlock()
+
 	}
 
 	return nil
